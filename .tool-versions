@@ -1,3 +1,7 @@
+nodejs 22.21.1
+golang 1.26.11
+
+# Keep the version entries first: setup-node can read a standalone '#' as a version.
 # Single source of truth for toolchain versions (requirement: reliability).
 #
 # CI, Docker images, local dev and pre-commit checks all read the pinned values
@@ -8,5 +12,3 @@
 # toolchain makes CI nondeterministic: the same commit can pass on Monday and
 # fail on Wednesday because a toolchain was released overnight, which destroys
 # the "same code, same result" property this POC is meant to measure.
-nodejs 22.21.1
-golang 1.26.11
