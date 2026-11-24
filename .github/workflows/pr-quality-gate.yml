@@ -1,0 +1,673 @@
+# =============================================================================
+# PR QUALITY GATE — the required status check for merging into main.
+# =============================================================================
+#
+# WHAT THIS WORKFLOW IS FOR
+# To answer one question with one boolean: may this pull request be merged?
+# It validates. It never publishes, deploys or pushes an image (requirement 6).
+#
+# THE CONTRACT IT IMPLEMENTS
+#   1. Build validation          frontend + backend must compile
+#   2. Lint / static analysis    eslint, gofmt, go vet
+#   3. Type checking             tsc --noEmit (frontend only; see note below)
+#   4. Unit tests                vitest, go test
+#   5. Change-aware execution    dorny/paths-filter decides what runs
+#   6. No publishing             buildx with push: false, no registry login
+#   7. Clear failure feedback    one named step per validation
+#   8. Security baseline         npm audit + govulncheck + dependency review
+#   9. Least privilege           contents: read, nothing else
+#  10. Traceability              not applicable to PR CI; see release.yml
+#
+# WHY TYPE CHECKING IS NOT APPLIED UNIFORMLY
+# Requirement 3 says "do not force type checking onto components where it is not
+# technically applicable". The backend is Go: statically typed, and `go build`
+# plus `go vet` already fail on a type error, so a separate "type check" step
+# would be theatre. The frontend is TypeScript transpiled by esbuild via Vite,
+# and esbuild strips types without checking them — so `tsc --noEmit` is
+# genuinely load-bearing there. That asymmetry is documented, not smoothed over.
+#
+# WHICH CHECK TO REQUIRE
+# A job whose `if` is false is reported SKIPPED, and GitHub treats a skipped job
+# as satisfying branch protection. So the component jobs can never themselves be
+# the required check. Require exactly `quality-gate / required`, which always
+# runs. See docs/github-branch-protection.md.
+#
+# TOOLCHAIN VERSIONS
+# Every job reads .tool-versions via the setup actions' version-file inputs, so
+# there is one source of truth. scripts/ci/verify-toolchain-sync.sh (in the
+# ci-self-check job) fails the build if the Dockerfiles or the Actions lock file
+# ever disagree with it.
+# =============================================================================
+name: PR Quality Gate
+
+on:
+  pull_request:
+    branches: [main]
+    types: [opened, synchronize, reopened, ready_for_review]
+
+# -----------------------------------------------------------------------------
+# Requirement 9: least privilege.
+#
+# Declared at workflow level so it cannot be missed, and deliberately read-only.
+# This workflow must not be able to write to the repository, publish a release,
+# comment on the PR, or mint an OIDC cloud identity. Read-only contents access is
+# all it needs. If a future step genuinely needs more, grant it on that single
+# job and say why in a comment — never widen this block.
+# -----------------------------------------------------------------------------
+permissions:
+  contents: read
+
+# Cancel superseded runs of the same PR. Without this, pushing three commits in
+# a minute pays for three full pipelines and delays the one that matters.
+concurrency:
+  group: pr-quality-gate-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  # ---------------------------------------------------------------------------
+  # Step 0: decide what actually needs to run (requirement 5).
+  #
+  # Always runs, always cheap. Every other job reads its verdict from its own
+  # `if`, so the decision is auditable in the run log instead of hidden in a
+  # shell variable that a later step might forget to check.
+  # ---------------------------------------------------------------------------
+  detect-changes:
+    name: "Detect changed components"
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    outputs:
+      frontend: ${{ steps.filter.outputs.frontend }}
+      backend: ${{ steps.filter.outputs.backend }}
+      shared: ${{ steps.filter.outputs.shared }}
+      frontend_docker: ${{ steps.filter.outputs.frontend_docker }}
+      backend_docker: ${{ steps.filter.outputs.backend_docker }}
+      docs_only: ${{ steps.docs_only.outputs.value }}
+    steps:
+      - name: Check out the pull request
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          # paths-filter diffs against the base branch, so it needs history.
+          fetch-depth: 0
+
+      - name: Evaluate path filters
+        id: filter
+        uses: dorny/paths-filter@ceb8a2b8f2d89434be7ff52d3de7ec3738c5cc9d # v4.0.3
+        with:
+          filters: .github/ci/paths-filter.yaml
+          predicate-quantifier: some-with-excludes
+          list-files: shell
+
+      - name: Record whether this is a documentation-only change
+        id: docs_only
+        env:
+          FRONTEND: ${{ steps.filter.outputs.frontend }}
+          BACKEND: ${{ steps.filter.outputs.backend }}
+          SHARED: ${{ steps.filter.outputs.shared }}
+          DOCS: ${{ steps.filter.outputs.docs }}
+        run: |
+          set -euo pipefail
+          # Called out in the summary because it is the clearest visible proof
+          # that change-aware execution is working.
+          if [[ "$DOCS" == "true" && "$FRONTEND" != "true" && "$BACKEND" != "true" && "$SHARED" != "true" ]]; then
+            echo "value=true" >>"$GITHUB_OUTPUT"
+          else
+            echo "value=false" >>"$GITHUB_OUTPUT"
+          fi
+
+      - name: Publish the change-detection decision
+        env:
+          FRONTEND: ${{ steps.filter.outputs.frontend }}
+          BACKEND: ${{ steps.filter.outputs.backend }}
+          SHARED: ${{ steps.filter.outputs.shared }}
+          FRONTEND_DOCKER: ${{ steps.filter.outputs.frontend_docker }}
+          BACKEND_DOCKER: ${{ steps.filter.outputs.backend_docker }}
+          DOCS_ONLY: ${{ steps.docs_only.outputs.value }}
+        run: |
+          set -uo pipefail
+          component_frontend="no — skipped"
+          component_backend="no — skipped"
+          [[ "$FRONTEND" == "true" || "$SHARED" == "true" ]] && component_frontend="yes"
+          [[ "$BACKEND" == "true" || "$SHARED" == "true" ]] && component_backend="yes"
+
+          {
+            echo "### Change detection"
+            echo
+            echo "| Gate | Will run |"
+            echo "| --- | --- |"
+            echo "| Frontend quality | ${component_frontend} |"
+            echo "| Backend quality | ${component_backend} |"
+            echo "| Docker verification · frontend | $([[ "$FRONTEND_DOCKER" == "true" ]] && echo 'yes' || echo 'no — skipped') |"
+            echo "| Docker verification · backend | $([[ "$BACKEND_DOCKER" == "true" ]] && echo 'yes' || echo 'no — skipped') |"
+            echo
+            if [[ "$DOCS_ONLY" == "true" ]]; then
+              echo "> Documentation-only change: no component gate is required."
+            fi
+          } >>"$GITHUB_STEP_SUMMARY"
+
+          echo "frontend=$FRONTEND backend=$BACKEND shared=$SHARED"
+          echo "frontend_docker=$FRONTEND_DOCKER backend_docker=$BACKEND_DOCKER docs_only=$DOCS_ONLY"
+
+  # ---------------------------------------------------------------------------
+  # FRONTEND (requirements 1-4, 5, 7).
+  #
+  # One step per validation, so the Checks tab reads
+  # "Frontend Quality › Type check (tsc --noEmit)" rather than "failed", and each
+  # step prints the command to reproduce it locally.
+  #
+  # Order is deliberate: lint and type checking are where most mistakes happen
+  # and cost seconds, so a developer learns about them almost immediately rather
+  # than after a full build.
+  # ---------------------------------------------------------------------------
+  frontend-quality:
+    name: "Frontend Quality"
+    needs: detect-changes
+    if: needs.detect-changes.outputs.frontend == 'true' || needs.detect-changes.outputs.shared == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Check out the pull request
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Set up Node from .tool-versions
+        id: node
+        uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version-file: .tool-versions
+          # Caches npm keyed on the lockfile, so the cache is invalidated when
+          # dependencies change and not when unrelated files do.
+          cache: npm
+          cache-dependency-path: frontend/package-lock.json
+
+      - name: Record the toolchain used
+        run: |
+          set -euo pipefail
+          echo "Node ${{ steps.node.outputs.node-version }} · npm $(npm --version)"
+          {
+            echo "### Frontend quality · toolchain"
+            echo
+            echo "- Node ${{ steps.node.outputs.node-version }} (pinned in \`.tool-versions\`)"
+            echo "- npm $(npm --version)"
+          } >>"$GITHUB_STEP_SUMMARY"
+
+      # Runs the same script a developer runs, so CI and a laptop execute byte-identical
+      # commands. Inside it: `npm ci`, not `npm install`, because the latter may resolve
+      # newer versions and have CI validate a dependency graph nobody reviewed. It also
+      # verifies the installed tree matches the committed lockfile rather than a leftover
+      # `node_modules` from another branch -- measured behaviour of npm 10.9.8 is documented
+      # in docs/security-baseline.md, including which tampering it does and does not reject.
+      - name: "Install dependencies (npm ci)"
+        run: ./scripts/check-frontend.sh install
+
+      - name: "Lint (eslint)"
+        run: ./scripts/check-frontend.sh lint
+
+      - name: "Type check (tsc --noEmit)"
+        run: ./scripts/check-frontend.sh typecheck
+
+      - name: "Unit tests (vitest)"
+        run: ./scripts/check-frontend.sh test
+
+      # Requirement 1: a build failure here means the PR cannot merge.
+      - name: "Build validation (vite build)"
+        run: ./scripts/check-frontend.sh build
+
+  # ---------------------------------------------------------------------------
+  # BACKEND (requirements 1, 2, 4, 5, 7). Runs only for backend/shared changes.
+  # ---------------------------------------------------------------------------
+  backend-quality:
+    name: "Backend Quality"
+    needs: detect-changes
+    if: needs.detect-changes.outputs.backend == 'true' || needs.detect-changes.outputs.shared == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Check out the pull request
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Set up Go from .tool-versions
+        id: go
+        uses: actions/setup-go@d8cbb8045d7f43706b9177cceb36c1f91a6644d5 # v7.1.0
+        with:
+          go-version-file: .tool-versions
+          # Caching is off on purpose: this module has no third-party
+          # dependencies, so save/restore costs more than it saves. Re-enable it
+          # in the same commit that adds the first real dependency.
+          cache: false
+
+      - name: Record the toolchain used
+        run: |
+          set -euo pipefail
+          echo "Go ${{ steps.go.outputs.go-version }}"
+          {
+            echo "### Backend quality · toolchain"
+            echo
+            echo "- Go ${{ steps.go.outputs.go-version }} (pinned in \`.tool-versions\`)"
+          } >>"$GITHUB_STEP_SUMMARY"
+
+      - name: "Format check (gofmt)"
+        run: ./scripts/check-backend.sh fmt
+
+      - name: "Static analysis (go vet)"
+        run: ./scripts/check-backend.sh vet
+
+      - name: "Unit tests (go test)"
+        run: ./scripts/check-backend.sh test
+
+      - name: "Build validation (go build)"
+        run: ./scripts/check-backend.sh build
+
+  # ---------------------------------------------------------------------------
+  # SECURITY BASELINE — requirement 8.
+  #
+  # What runs, and what blocks:
+  #   npm audit (frontend)      production HIGH/CRITICAL block; dev-only
+  #                             findings are reported. Frontend/shared changes.
+  #   govulncheck (backend)     reachable third-party findings block;
+  #                             standard-library findings are reported, not
+  #                             blocking. Backend/shared changes.
+  #   Dependency Review (next job) only the dependencies THIS PR adds.
+  #
+  # Thresholds live in .ci/security-policies.env, are printed by every run, and
+  # the reasoning plus the open team decisions are in docs/security-baseline.md.
+  #
+  # Deliberately absent: container image scanning and SAST. Both are slower than
+  # the rest of the gate combined and belong in the scheduled workflow — see
+  # docs/extending-the-gate.md.
+  # ---------------------------------------------------------------------------
+  security-dependencies:
+    name: "Security · Dependency vulnerabilities"
+    needs: detect-changes
+    if: needs.detect-changes.outputs.frontend == 'true' || needs.detect-changes.outputs.backend == 'true' || needs.detect-changes.outputs.shared == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Check out the pull request
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Show the security policy being applied
+        run: |
+          set -euo pipefail
+          echo "Thresholds from .ci/security-policies.env:"
+          grep -Ev '^[[:space:]]*(#|$)' .ci/security-policies.env | sed 's/^/  /'
+          {
+            echo "### Security baseline"
+            echo
+            echo "Thresholds come from [\`.ci/security-policies.env\`](../blob/main/.ci/security-policies.env). Behaviour and open questions: [docs/security-baseline.md](../blob/main/docs/security-baseline.md)."
+          } >>"$GITHUB_STEP_SUMMARY"
+
+      - name: Set up Node for npm audit
+        if: needs.detect-changes.outputs.frontend == 'true' || needs.detect-changes.outputs.shared == 'true'
+        uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version-file: .tool-versions
+
+      - name: "Frontend · npm dependency audit"
+        if: needs.detect-changes.outputs.frontend == 'true' || needs.detect-changes.outputs.shared == 'true'
+        run: ./scripts/security/scan-frontend-deps.sh
+
+      - name: Set up Go for govulncheck
+        if: needs.detect-changes.outputs.backend == 'true' || needs.detect-changes.outputs.shared == 'true'
+        uses: actions/setup-go@d8cbb8045d7f43706b9177cceb36c1f91a6644d5 # v7.1.0
+        with:
+          go-version-file: .tool-versions
+          cache: false
+
+      - name: "Backend · govulncheck (call-graph aware)"
+        if: needs.detect-changes.outputs.backend == 'true' || needs.detect-changes.outputs.shared == 'true'
+        run: ./scripts/security/scan-backend-deps.sh
+
+  # ---------------------------------------------------------------------------
+  # Requirement 8, GitHub-native half: judge only the dependencies this PR
+  # introduces, using GitHub's advisory database.
+  #
+  # This complements the job above rather than duplicating it. npm audit and
+  # govulncheck judge the repository as it currently stands, so a vulnerability
+  # already on main keeps every PR red until somebody fixes it. Dependency Review
+  # asks the question a reviewer actually wants answered: "does THIS change make
+  # us worse?"
+  # ---------------------------------------------------------------------------
+  security-dependency-review:
+    name: "Security · Dependency review"
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    # Needs a base to diff against, so it only makes sense on a pull request.
+    # Draft PRs are excluded to avoid spending runner minutes on work in
+    # progress; the full gate runs the moment the PR is marked ready.
+    if: github.event_name == 'pull_request' && github.event.pull_request.draft == false
+    steps:
+      - name: Check out the pull request
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: "Block newly introduced HIGH/CRITICAL runtime vulnerabilities"
+        uses: actions/dependency-review-action@bbc44d14a204704ccc493733616cd1e93a0321ec # v5.0.1
+        with:
+          # HIGH and above block. `moderate` is left to reporting: GitHub flags a
+          # lot of them, many with no available fix, and a permanently-red gate
+          # is a gate people learn to ignore.
+          fail-on-severity: high
+          # Runtime dependencies reach users; development dependencies do not.
+          # Deliberately mirrors the scope split used by the npm audit gate.
+          fail-on-scopes: runtime
+          # Renders in the Checks tab. PR comments are off so this workflow keeps
+          # `pull-requests: none` (requirement 9).
+          comment-summary-in-pr: never
+          vulnerability-check: true
+          # Licence policy is a legal decision, not a CI decision. Enable once an
+          # allowed-licence list exists — see docs/extending-the-gate.md.
+          license-check: false
+
+  # ---------------------------------------------------------------------------
+  # Requirement 6: PR CI may prove a Dockerfile builds, but must never publish.
+  #
+  # Note what is absent: no registry login, no credentials, and `push: false` is
+  # hard-coded rather than derived from an input, so no parameter can flip it.
+  # There is no path from this workflow to a registry.
+  #
+  # `load: true` keeps the built image in the local Docker daemon so a later step
+  # can assert it exists. Build provenance/SBOM attestations are intentionally NOT
+  # requested here: BuildKit cannot attach attestations to a `load`ed image, and
+  # PR images are throwaway. Attestations belong to release.yml.
+  # ---------------------------------------------------------------------------
+  docker-verify-backend:
+    name: "Docker verification · backend"
+    needs: detect-changes
+    if: needs.detect-changes.outputs.backend_docker == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - name: Check out the pull request
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Set up BuildKit
+        uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
+
+      - name: "Build backend image (push disabled)"
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
+        with:
+          context: backend
+          file: backend/Dockerfile
+          push: false
+          load: true
+          # Tagged with the commit SHA so the verification step can name exactly
+          # what it checked, and so a local build looks like a CI build.
+          tags: |
+            quality-gate-backend:pr-${{ github.event.pull_request.number }}
+            quality-gate-backend:${{ github.sha }}
+          cache-from: type=gha,scope=backend-pr
+          cache-to: type=gha,scope=backend-pr,mode=max
+
+      - name: "Assert: image built locally and nothing was pushed"
+        run: |
+          set -euo pipefail
+          image="quality-gate-backend:${GITHUB_SHA}"
+          docker image inspect "$image" >/dev/null
+          size="$(docker image inspect --format '{{.Size}}' "$image")"
+          echo "Loaded locally: $image ($size bytes)"
+          echo "This workflow defines no registry credentials, so nothing could have been pushed."
+          {
+            echo "### Docker verification · backend"
+            echo
+            echo "Built and loaded locally; \`push: false\`. No registry credentials exist in this workflow."
+            echo
+            echo "- Image: \`$image\` ($size bytes)"
+          } >>"$GITHUB_STEP_SUMMARY"
+
+  docker-verify-frontend:
+    name: "Docker verification · frontend"
+    needs: detect-changes
+    if: needs.detect-changes.outputs.frontend_docker == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - name: Check out the pull request
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Set up BuildKit
+        uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
+
+      - name: "Build frontend image (push disabled)"
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
+        with:
+          context: frontend
+          file: frontend/Dockerfile
+          push: false
+          load: true
+          tags: |
+            quality-gate-frontend:pr-${{ github.event.pull_request.number }}
+            quality-gate-frontend:${{ github.sha }}
+          build-args: |
+            APP_VERSION=pr-${{ github.event.pull_request.number }}
+            GIT_SHA=${{ github.sha }}
+          cache-from: type=gha,scope=frontend-pr
+          cache-to: type=gha,scope=frontend-pr,mode=max
+
+      - name: "Assert: image built locally and nothing was pushed"
+        run: |
+          set -euo pipefail
+          image="quality-gate-frontend:${GITHUB_SHA}"
+          docker image inspect "$image" >/dev/null
+          size="$(docker image inspect --format '{{.Size}}' "$image")"
+          echo "Loaded locally: $image ($size bytes)"
+          echo "This workflow defines no registry credentials, so nothing could have been pushed."
+
+  # ---------------------------------------------------------------------------
+  # CI self-validation.
+  #
+  # A gate is only trustworthy if the gate itself cannot silently rot. These
+  # checks fail when the workflow files stop parsing, when toolchain pins drift
+  # apart, when the path filters stop covering a component, or when the gate
+  # scripts change without their own tests passing.
+  #
+  # Runs on every PR regardless of paths: it protects the pipeline, which any
+  # change to the pipeline can break.
+  # ---------------------------------------------------------------------------
+  security-secrets:
+    name: "Security · Secret leak scan"
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    # Runs on every PR regardless of paths. A secret can be introduced by any
+    # change, including a docs change (a copied .env snippet in a README is a real
+    # and common leak), and a scan that is skipped by path filtering is not a scan.
+    steps:
+      - name: Check out the pull request
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          # gitleaks scans the commits the PR introduces, so it needs history
+          # back to the merge base — not just the tip.
+          fetch-depth: 0
+
+      - name: "Scan the pull request's commits for secrets (gitleaks)"
+        env:
+          # Base SHA to start from. Empty on the first push, in which case the
+          # script falls back to scanning the whole commit range it is given.
+          GITLEAKS_BASE: ${{ github.event.pull_request.base.sha }}
+        run: ./scripts/security/scan-secrets.sh
+
+  # ---------------------------------------------------------------------------
+  # CI self-validation.
+  #
+  # A gate is only trustworthy if the gate itself cannot silently rot. These
+  # checks fail when the workflow files stop parsing, when toolchain pins drift
+  # apart, when the path filters stop covering a component, or when the gate
+  # scripts change without their own tests passing.
+  #
+  # Runs on every PR regardless of paths: it protects the pipeline, which any
+  # change to the pipeline can break.
+  # ---------------------------------------------------------------------------
+  ci-self-check:
+    name: "CI self-check"
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Check out the pull request
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Set up Node from .tool-versions
+        id: node
+        uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version-file: .tool-versions
+
+      - name: "Verify toolchain pins agree across all config files"
+        run: ./scripts/ci/verify-toolchain-sync.sh
+
+      - name: "Verify path filters cover every component and required file"
+        run: ./scripts/ci/verify-path-filters.sh
+
+      # Every tracked file must trigger at least one filter, or a PR touching it validates
+      # nothing while the required check reports success. Distinct from the step above: that
+      # one checks Dockerfile COPY sources, this one checks the whole repository, and it is
+      # the only thing that would notice a new top-level directory being invisible.
+      - name: "Audit that every tracked file is covered by a path filter"
+        run: node scripts/ci/audit-filter-coverage.mjs
+
+      - name: "Verify representative PR shapes trigger the right jobs"
+        run: node scripts/ci/verify-change-aware-scenarios.mjs
+
+      - name: "Lint the workflow definitions (actionlint)"
+        run: ./scripts/ci/lint-workflows.sh
+
+      - name: "Run the gate's own tests"
+        run: node --test scripts/security/*.test.mjs
+
+      # Proves the secret scanner still detects secrets. Nothing else can: a scanner
+      # whose allowlist has quietly broadened passes every scan of a repository that
+      # contains nothing. See docs/security-baseline.md.
+      - name: "Canary-test the secret scanner"
+        run: ./scripts/security/selftest-secrets.sh
+
+      # docker-compose.yml is in no path filter -- it affects nothing CI builds -- so this
+      # job is the only thing that notices when it breaks. Without it the file rots while the
+      # README keeps telling people to run `docker compose up --build`. `config --quiet` parses
+      # and resolves the whole model (services, ports, build contexts, env interpolation)
+      # without starting anything, so the check costs about a second.
+      #
+      # Flags verified against the installed Compose rather than assumed: an earlier version of
+      # this step passed `--no-external`, which does not exist in Compose v5 and failed the step
+      # for reasons unrelated to the file being checked. Only `--quiet` is relied on here; it
+      # has been stable across the versions that matter, and the fewer version-specific flags
+      # a gate uses, the fewer ways it can break without the repository changing.
+      - name: "Verify docker-compose.yml still resolves"
+        run: |
+          set -euo pipefail
+          if ! docker compose -f docker-compose.yml config --quiet; then
+            echo '::error::docker-compose.yml does not resolve' >&2
+            echo '::error::fix: docker compose -f docker-compose.yml config' >&2
+            exit 1
+          fi
+          # Assert the file declares the two services the README names, so a rename or an
+          # accidental deletion is a failure rather than a compose file that quietly resolves
+          # to one service. `config --quiet` accepts almost anything syntactically valid.
+          services="$(docker compose -f docker-compose.yml config --services | sort | tr '\n' ' ')"
+          if [[ "$services" != "backend frontend " ]]; then
+            echo "::error::docker-compose.yml does not define both the 'backend' and 'frontend' services (got: ${services})" >&2
+            echo "::error::fix: the README documents 'docker compose up --build' starting both services; keep the names in sync or update the README in the same PR" >&2
+            exit 1
+          fi
+          echo "[OK]    docker-compose.yml resolves · services: ${services}"
+
+  # ---------------------------------------------------------------------------
+  # THE REQUIRED CHECK.
+  #
+  # Why not protect the jobs above directly? A job whose `if` is false is SKIPPED,
+  # and GitHub counts a skipped job as satisfying branch protection. So "Frontend
+  # Quality" can never be the required check: on a backend-only PR it is skipped,
+  # and a red backend would merge.
+  #
+  # This job always runs, and its exit code is the conjunction of the checks that
+  # were actually applicable. Require exactly `quality-gate / required`.
+  #
+  # `if: always()` is essential. Without it GitHub would skip this job whenever a
+  # required dependency failed, converting a red gate into a green-looking
+  # absence — the single worst failure mode a merge gate can have.
+  # ---------------------------------------------------------------------------
+  quality-gate:
+    name: "required"
+    needs:
+      - detect-changes
+      - frontend-quality
+      - backend-quality
+      - security-dependencies
+      - security-dependency-review
+      - security-secrets
+      - docker-verify-backend
+      - docker-verify-frontend
+      - ci-self-check
+    if: always()
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Aggregate applicable checks into one merge verdict
+        env:
+          # result() yields success | failure | cancelled | skipped.
+          FRONTEND_RESULT: ${{ needs.frontend-quality.result }}
+          BACKEND_RESULT: ${{ needs.backend-quality.result }}
+          SECURITY_RESULT: ${{ needs.security-dependencies.result }}
+          DEPREVIEW_RESULT: ${{ needs.security-dependency-review.result }}
+          SECRETS_RESULT: ${{ needs.security-secrets.result }}
+          DOCKER_BACKEND_RESULT: ${{ needs.docker-verify-backend.result }}
+          DOCKER_FRONTEND_RESULT: ${{ needs.docker-verify-frontend.result }}
+          SELF_CHECK_RESULT: ${{ needs.ci-self-check.result }}
+          DOCS_ONLY: ${{ needs.detect-changes.outputs.docs_only }}
+        run: |
+          set -uo pipefail
+
+          STATUS=0
+          ROWS=""
+
+          # A check that did not run is reported as "not applicable", never as a
+          # pass. Someone asking "was that actually tested?" must get an honest
+          # answer from the summary.
+          judge() {
+            local label="$1" result="$2"
+            case "$result" in
+              success)  ROWS="${ROWS}| ${label} | applicable | pass |"$'\n' ;;
+              skipped)  ROWS="${ROWS}| ${label} | not applicable | skipped (no relevant change) |"$'\n' ;;
+              cancelled)
+                        ROWS="${ROWS}| ${label} | applicable | **cancelled** |"$'\n'
+                        STATUS=1 ;;
+              *)
+                        ROWS="${ROWS}| ${label} | applicable | **${result}** |"$'\n'
+                        STATUS=1 ;;
+            esac
+          }
+
+          judge "Frontend quality (lint, types, tests, build)" "$FRONTEND_RESULT"
+          judge "Backend quality (fmt, vet, tests, build)" "$BACKEND_RESULT"
+          judge "Security · dependency vulnerabilities" "$SECURITY_RESULT"
+          judge "Security · dependency review" "$DEPREVIEW_RESULT"
+          judge "Security · secret leak scan" "$SECRETS_RESULT"
+          judge "Docker verification · backend" "$DOCKER_BACKEND_RESULT"
+          judge "Docker verification · frontend" "$DOCKER_FRONTEND_RESULT"
+          judge "CI self-check" "$SELF_CHECK_RESULT"
+
+          {
+            echo "## Quality gate verdict"
+            echo
+            echo "| Check | Applicability | Result |"
+            echo "| --- | --- | --- |"
+            printf '%s' "$ROWS"
+            echo
+            if [[ "$STATUS" -eq 0 ]]; then
+              echo "**Merge gate: PASS** for commit \`${GITHUB_SHA::7}\`."
+            else
+              echo "**Merge gate: FAIL** for commit \`${GITHUB_SHA::7}\` — see the red job names above."
+              echo
+              echo "Each failing job maps to exactly one validation, and its step names say which one."
+            fi
+            echo
+            if [[ "$DOCS_ONLY" == "true" ]]; then
+              echo "> Documentation-only change: component gates were correctly skipped."
+            fi
+          } >>"$GITHUB_STEP_SUMMARY"
+
+          if [[ "$STATUS" -ne 0 ]]; then
+            echo "::error::Required quality gate failed. The failing job names above each map to one validation."
+            exit 1
+          fi
+
+          echo "All applicable checks passed. This PR may merge once it is approved."

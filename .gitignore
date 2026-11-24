@@ -1,0 +1,28 @@
+# --- Node / frontend ---
+node_modules/
+dist/
+coverage/
+*.tsbuildinfo
+.eslintcache
+
+# --- Go / backend ---
+backend/bin/
+*.test
+coverage.out
+
+# --- Editor / OS ---
+.DS_Store
+.idea/
+.vscode/
+*.swp
+
+# --- Local env (never commit real credentials) ---
+.env
+.env.*
+!.env.example
+
+# --- CI scratch ---
+.tmp/
+# Secret-scan report. It is redacted, but a file named after secrets has no
+# business being committed.
+.gitleaks-report.json

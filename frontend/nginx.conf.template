@@ -1,0 +1,67 @@
+# Serves the built SPA and proxies /api/ to the backend.
+#
+# Rendered by the nginx image's entrypoint (envsubst) into
+# /etc/nginx/conf.d/default.conf, with ${API_UPSTREAM} substituted. That is the
+# official mechanism for making nginx config configurable at run time, and it is
+# why this file is a `.template`.
+#
+# Port 8080 rather than 80 so the container can run without root privileges.
+server {
+    listen 8080;
+    server_name _;
+
+    root /usr/share/nginx/html;
+    index index.html;
+
+    # Docker's embedded DNS. Needed because the /api/ upstream below is resolved
+    # lazily (see the note there); nginx must be told where to ask. On a Docker
+    # user-defined network this is 127.0.0.11. If it is unreachable, requests to
+    # /api/ fail at request time instead of the container failing to start, which
+    # is the correct trade-off for a frontend that renders without its API.
+    resolver 127.0.0.11 ipv6=off valid=10s;
+
+    # Hashed asset names in production, so they can be cached aggressively.
+    location /assets/ {
+        expires 1y;
+        add_header Cache-Control "public, immutable";
+        try_files $uri =404;
+    }
+
+    # THE REASON THIS IS NOT `proxy_pass http://backend:8080;`
+    # A literal hostname in proxy_pass is resolved when nginx reads its config, so
+    # the container exits immediately whenever the backend is not on the same
+    # network. That makes the frontend image unrunnable on its own, and an image
+    # that cannot start is an image that fails verification.
+    #
+    # Assigning the host to a variable makes nginx resolve it per request instead:
+    # the container always starts, and /api/ returns 502 while the backend is
+    # absent. The SPA handles a missing API as a degraded state by design.
+    location /api/ {
+        set $api_upstream ${API_UPSTREAM};
+        proxy_pass http://$api_upstream:8080;
+        proxy_http_version 1.1;
+        proxy_set_header Host $host;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto $scheme;
+        # Fail fast rather than hang a browser request when the API is down.
+        proxy_connect_timeout 2s;
+        proxy_read_timeout 5s;
+    }
+
+    # SPA fallback: unknown paths serve the app shell.
+    location / {
+        try_files $uri $uri/ /index.html;
+    }
+
+    # Liveness for the web server itself. Deliberately does NOT depend on the
+    # backend: if it did, a backend outage would look like a dead frontend and
+    # orchestrators would restart the wrong service.
+    location = /healthz {
+        access_log off;
+        add_header Content-Type text/plain;
+        return 200 "ok\n";
+    }
+
+    gzip on;
+    gzip_types text/css application/javascript application/json image/svg+xml;
+}

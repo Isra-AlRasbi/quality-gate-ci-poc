@@ -1,0 +1,76 @@
+# Path filters for change-aware CI (requirement 5).
+#
+# Read by .github/workflows/pr-quality-gate.yml via dorny/paths-filter.
+# This file is deliberately outside .github/workflows/ so that editing the
+# filters is itself a "shared" change and re-runs every component gate — the
+# filters cannot silently narrow themselves.
+#
+# Design rule: a component's gate runs when that component changes OR when the
+# pipeline that validates it changes. It never runs "just in case".
+#
+# The pinned action uses picomatch with dot:true, so these globs include dotfiles.
+# The workflow uses some-with-excludes so Docker exclusions override inclusions.
+
+frontend:
+  - 'frontend/**'
+
+backend:
+  - 'backend/**'
+
+# Changes here can affect every component, so they trigger all gates.
+shared:
+  - '.github/workflows/**'
+  - '.github/ci/**'
+  - '.ci/**'
+  - 'scripts/**'
+  - '.editorconfig'
+  - '.gitignore'
+  # NOT listed, deliberately: '.gitleaks.toml' affects only the secret scanner, and the two
+  # jobs that read it (`ci-self-check`, `security-secrets`) run on every PR regardless of
+  # paths. Putting it here would mean a scanner-config tweak rebuilds both Docker images to
+  # validate nothing about the change. scripts/ci/audit-filter-coverage.mjs knows it is
+  # exempt and checks those jobs are still unconditional.
+  # A toolchain bump changes what every gate compiles and tests against, so it is
+  # by definition not a change to one component.
+  - '.tool-versions'
+
+# Docker validation is only useful when something the image actually contains
+# changed. Kept separate from `shared` so a README or CI-config edit does not spend
+# 60-90s building images that cannot have changed.
+#
+# WHY THESE COVER THE WHOLE COMPONENT DIRECTORY (AND WHY THAT IS NOT LAZY)
+# Both Dockerfiles contain `COPY . .`, so every file that survives .dockerignore is
+# part of the image build context. A hand-maintained list of "files that matter" is
+# therefore provably incomplete: the day someone adds `frontend/config.json` and a
+# COPY line for it, a change to that file silently skips the only job that builds and
+# runs the image.
+#
+# This exact drift happened while building this POC — `nginx.conf.template` was
+# copied by the Dockerfile but missing from the list. So the filter mirrors the
+# build context (whole directory, minus what .dockerignore removes) rather than
+# guessing at it, and scripts/ci/verify-path-filters.sh enforces the agreement
+# between each Dockerfile's COPY instructions and these patterns.
+#
+# The saving compared to the component filter is real but modest: docs and build
+# output inside the component directory. That is the honest size of this
+# optimisation, and it is why the docker jobs are the cheapest jobs to drop if the
+# gate ever needs to get faster.
+frontend_docker:
+  - 'frontend/**'
+  # Mirrors frontend/.dockerignore: none of these reach the image.
+  - '!frontend/dist/**'
+  - '!frontend/coverage/**'
+  - '!frontend/node_modules/**'
+  - '!frontend/*.md'
+
+backend_docker:
+  - 'backend/**'
+  # Mirrors backend/.dockerignore.
+  - '!backend/bin/**'
+  - '!backend/*.md'
+
+# Used only to report "documentation-only change" in the job summary.
+docs:
+  - 'README.md'
+  - 'docs/**'
+  - '.github/pull_request_template.md'

@@ -1,0 +1,226 @@
+# =============================================================================
+# SCHEDULED / HEAVY CHECKS — validation that is too slow to block a PR.
+# =============================================================================
+#
+# WHY THIS WORKFLOW EXISTS AS A SEPARATE FILE
+# The PR gate has one job: answer "may this merge?" in a couple of minutes. Some
+# necessary checks cannot answer that quickly — a full image vulnerability scan
+# needs to download a vulnerability database, and a secret scan of all history is
+# O(commits). Putting them in the PR gate does not make them run sooner; it makes
+# developers slow, and then work around the gate.
+#
+# These checks therefore run on a schedule, where latency is measured in hours and
+# a slow scan costs nothing. The rule this file encodes:
+#
+#   A check that can be slow but must not be skipped belongs HERE, not in the PR
+#   gate. Speed is bought by moving work, not by dropping it.
+#
+# FAILURE HANDLING — READ THIS BEFORE ADDING A CHECK
+# A nightly that nobody sees failing is decoration. Deliberately:
+#   - no `continue-on-error` anywhere in this file
+#   - the final job aggregates results and fails the run
+#   - branch protection CANNOT surface a scheduled failure, because scheduled runs
+#     are not tied to a PR. So the notification path must be configured: Settings ->
+#     Notifications -> "Checks" for this repository, or better, a workflow that posts
+#     the failed run to the team channel. See docs/extending-the-gate.md.
+#
+# PERMISSIONS: read-only. Nothing here publishes or writes anything.
+# =============================================================================
+name: Scheduled Checks
+
+on:
+  schedule:
+    # Daily, off the top of the hour to avoid the busiest runner queue.
+    - cron: '17 3 * * *'
+  workflow_dispatch:
+    inputs:
+      full_history_secrets:
+        description: 'Scan the entire commit history for secrets, not just recent commits'
+        required: false
+        type: boolean
+        default: true
+
+permissions:
+  contents: read
+
+concurrency:
+  group: scheduled-checks
+  # A half-finished scan is worth keeping: cancelling it on every new dispatch
+  # means a long scan may never complete.
+  cancel-in-progress: false
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  # ---------------------------------------------------------------------------
+  # Full secret history scan.
+  #
+  # The PR gate scans only the commits a change introduces. That misses a secret
+  # committed before the gate existed, which is the common case in any repository
+  # adopting secret scanning. This job closes that gap by scanning everything.
+  # ---------------------------------------------------------------------------
+  secrets-full-history:
+    name: "Secret scan · full history"
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: Check out the full history
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+
+      - name: "Scan every commit for credentials (gitleaks)"
+        # GITLEAKS_BASE is deliberately unset, which makes the script scan the
+        # whole repository rather than a range.
+        run: ./scripts/security/scan-secrets.sh
+
+  # ---------------------------------------------------------------------------
+  # Dependency vulnerabilities against a freshly-updated database.
+  #
+  # Why not just rely on the PR run: the PR gate judges the code you changed, on
+  # the day you changed it. A CVE published *after* your merge never re-triggers
+  # it, so a repository that merges quietly can sit on a known-exploitable
+  # dependency indefinitely. This job is what turns "we scan" into "we scan
+  # currently".
+  # ---------------------------------------------------------------------------
+  dependencies-current-state:
+    name: "Dependency vulnerabilities · current state"
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    steps:
+      - name: Check out main
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Set up Node from .tool-versions
+        uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version-file: .tool-versions
+
+      - name: "Frontend · npm audit (fresh advisory data)"
+        run: ./scripts/security/scan-frontend-deps.sh
+
+      - name: Set up Go from .tool-versions
+        uses: actions/setup-go@d8cbb8045d7f43706b9177cceb36c1f91a6644d5 # v7.1.0
+        with:
+          go-version-file: .tool-versions
+          cache: false
+
+      - name: "Backend · govulncheck (fresh advisory data)"
+        run: ./scripts/security/scan-backend-deps.sh
+
+      - name: "Report dependencies that are behind their pinned version"
+        # Not a security check: an information aid. A dependency three majors behind
+        # becomes progressively harder to update, and nobody looks at it while every
+        # scan is green. Informational by design — see docs/extending-the-gate.md for
+        # when an advisory should become blocking.
+        continue-on-error: true
+        run: ./scripts/ci/report-outdated-deps.sh
+
+  # ---------------------------------------------------------------------------
+  # Container image scan.
+  #
+  # Runs here rather than in the PR gate because a scanner must download a
+  # vulnerability database first (hundreds of MB), which would dominate the PR
+  # runtime for every commit including ones that touch no Dockerfile.
+  #
+  # STATUS: NOT YET IMPLEMENTED — intentionally left as an explicit gap.
+  # A stub that prints "skipped" and exits 0 is worse than no stub, because it
+  # appears in the Checks tab as a green pass. So this job is absent rather than
+  # empty, and the gap is recorded in README.md ("Checks that depend on
+  # architecture") and docs/extending-the-gate.md, with the exact steps to add it.
+  # ---------------------------------------------------------------------------
+
+  # ---------------------------------------------------------------------------
+  # Toolchain currency.
+  #
+  # Distinct from the vulnerability scan: govulncheck tells you a Go release is
+  # vulnerable, this tells you a newer release exists that you have not adopted.
+  # Both matter, because "pinned and current" and "pinned and ancient" look
+  # identical in CI until something starts failing.
+  # ---------------------------------------------------------------------------
+  toolchain-currency:
+    name: "Toolchain currency"
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Check out main
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: "Compare pinned versions against current releases"
+        run: |
+          set -uo pipefail
+          {
+            echo "## Toolchain currency"
+            echo
+            echo "| Component | Pinned | Latest seen | Note |"
+            echo "| --- | --- | --- | --- |"
+          } >>"$GITHUB_STEP_SUMMARY"
+
+          node_pin="$(sed -n 's/^nodejs \([^ ]*\).*/\1/p' .tool-versions)"
+          go_pin="$(sed -n 's/^golang \([^ ]*\).*/\1/p' .tool-versions)"
+          govulncheck_pin="$(sed -n 's/^GOVULNCHECK_VERSION=\([^ ]*\).*/\1/p' .github/ci/tools.lock.env)"
+
+          node_latest="$(curl -fsSL https://nodejs.org/dist/index.json 2>/dev/null \
+            | node -e 'let r="";process.stdin.on("data",c=>r+=c).on("end",()=>{try{const d=JSON.parse(r);console.log(d[0].version.replace(/^v/,""))}catch{console.log("unknown")}})' || echo unknown)"
+          go_latest="$(curl -fsSL 'https://proxy.golang.org/golang.org/x/vuln/cmd/govulncheck/@latest' 2>/dev/null >/dev/null; \
+            curl -fsSL 'https://go.dev/VERSION?m=text' 2>/dev/null | head -1 || echo unknown)"
+          govulncheck_latest="$(curl -fsSL 'https://proxy.golang.org/golang.org/x/vuln/@latest' 2>/dev/null \
+            | node -e 'let r="";process.stdin.on("data",c=>r+=c).on("end",()=>{try{console.log(JSON.parse(r).Version)}catch{console.log("unknown")}})' || echo unknown)"
+
+          row() { echo "| $1 | \`$2\` | \`$3\` | $4 |" >>"$GITHUB_STEP_SUMMARY"; }
+
+          row "Node.js" "$node_pin" "$node_latest" "$([[ "$node_pin" == "$node_latest" ]] && echo 'current' || echo 'behind — review whether to bump')"
+          row "Go" "$go_pin" "${go_latest#go}" "$([[ "$go_pin" == "${go_latest#go}" ]] && echo 'current' || echo 'behind — note that a stdlib CVE fix usually means bumping this')"
+          row "govulncheck" "$govulncheck_pin" "$govulncheck_latest" "$([[ "$govulncheck_pin" == "$govulncheck_latest" ]] && echo 'current' || echo 'behind')"
+
+          echo
+          echo "Being behind is not a failure. It becomes one when a reachable advisory"
+          echo "exists and the pinned version is the reason it cannot be fixed."
+
+  # ---------------------------------------------------------------------------
+  # Aggregate. Exists so that one red run answers "is the nightly healthy?" —
+  # a question a single status can answer. Per-job reds are for triage.
+  # ---------------------------------------------------------------------------
+  scheduled-verdict:
+    name: "required"
+    needs: [secrets-full-history, dependencies-current-state, toolchain-currency]
+    if: always()
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Aggregate scheduled results
+        env:
+          SECRETS_RESULT: ${{ needs.secrets-full-history.result }}
+          DEPS_RESULT: ${{ needs.dependencies-current-state.result }}
+          TOOLCHAIN_RESULT: ${{ needs.toolchain-currency.result }}
+        run: |
+          set -uo pipefail
+          STATUS=0
+          {
+            echo "## Scheduled checks verdict"
+            echo
+            echo "| Check | Result |"
+            echo "| --- | --- |"
+          } >>"$GITHUB_STEP_SUMMARY"
+
+          for pair in "Secret scan (full history):$SECRETS_RESULT" \
+                      "Dependency vulnerabilities (current state):$DEPS_RESULT" \
+                      "Toolchain currency:$TOOLCHAIN_RESULT"; do
+            label="${pair%%:*}"
+            result="${pair#*:}"
+            echo "| ${label} | ${result} |" >>"$GITHUB_STEP_SUMMARY"
+            if [[ "$result" != "success" && "$result" != "skipped" ]]; then
+              STATUS=1
+            fi
+          done
+
+          echo >>"$GITHUB_STEP_SUMMARY"
+          if [[ "$STATUS" -eq 0 ]]; then
+            echo "**Scheduled checks: PASS**" >>"$GITHUB_STEP_SUMMARY"
+          else
+            echo "**Scheduled checks: FAIL** — a scheduled check must be triaged, not ignored." >>"$GITHUB_STEP_SUMMARY"
+            echo "::error::A scheduled check failed. Scheduled failures do not block a merge, so the only signal is this run: investigate it as an incident, not as noise."
+            exit 1
+          fi

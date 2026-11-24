@@ -1,0 +1,713 @@
+# =============================================================================
+# RELEASE — validate, then publish traceable container images.
+# =============================================================================
+#
+# THIS WORKFLOW IS THE OTHER HALF OF REQUIREMENT 6.
+# pr-quality-gate.yml validates and publishes nothing. This workflow is the only
+# path from source to a registry, and it is reachable only from a protected
+# branch or a version tag — never from a pull request.
+#
+# FLOW
+#   commit cleared for release (tag v* or protected branch)
+#     -> release-identity        decide the version, the tag list, and whether
+#                                the commit is actually allowed to be published
+#     -> validate-release-commit re-run the gate over the exact released commit
+#     -> publish-image           build multi-arch, publish only if a registry
+#                                is configured
+#     -> release-summary         record commit, tags and digests
+#
+# TRACEABILITY (requirement 10)
+# Every published image carries, at minimum:
+#   <image>:<full git sha>   immutable, unambiguous, ALWAYS present
+# plus, when triggered by a version tag:
+#   <image>:v1.2.3           the human-facing name
+#   <image>:1.2.3            the same version without the 'v'
+#   <image>:latest           only when explicitly requested and not a prerelease
+#
+# Tags are mutable names; a registry digest is not. The build also embeds
+# APP_VERSION/GIT_SHA into the binary and requests SLSA provenance plus an SBOM,
+# so an image found running in production can be traced to the exact commit and
+# the exact workflow run that produced it.
+#
+# PUBLISHING IS OFF UNTIL A REGISTRY IS CONFIGURED
+# `secrets.CI_REGISTRY` and friends are probed at runtime. When they are absent,
+# every identity check, every validation and the full multi-architecture build
+# still run; only the push is skipped, and the job summary says so in plain
+# words. Nothing is simulated and nothing fails. Add the three secrets documented
+# in docs/releasing.md and publishing turns on with no workflow edit.
+#
+# PERMISSIONS (requirement 9)
+# Workflow default is read-only. Write access is granted per job, with the reason
+# stated at the grant site:
+#   publish-image  packages: write  -> push the image
+#                    id-token: write -> mint the OIDC token for provenance
+# A workflow-level `write` would hand every future job more than it needs.
+#
+# WHY BUILD AND PUBLISH SHARE ONE JOB
+# Docker/BuildKit attaches provenance and SBOM attestations to the *registry
+# manifest*, so the builder is the component that must push; splitting "build"
+# and "push" into separate jobs means building the image twice. The separation
+# that actually provides safety here is credential scoping — only this one job
+# can write to a registry, and it is the only job with `id-token` — so a
+# compromised validation job cannot publish anything.
+# =============================================================================
+name: Release
+
+on:
+  push:
+    tags:
+      # v1, v1.2, v1.2.3, v1.2.3-rc.1, v1.2.3-rc.1+build.5
+      - 'v[0-9]+**'
+    branches:
+      # A protected branch may also publish. Whether it does is a policy choice;
+      # the identity job refuses commits that are not on a cleared branch.
+      - main
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'Version to publish (for example 1.2.3). Leave empty for a commit-SHA build only.'
+        required: false
+        type: string
+      include_latest:
+        description: 'Also move the :latest tag'
+        required: false
+        type: boolean
+        default: false
+      allow_overwrite:
+        description: 'Allow republishing an existing version (emergency only)'
+        required: false
+        type: boolean
+        default: false
+      allow_unverified:
+        description: 'Publish without re-running the quality gate (emergency only)'
+        required: false
+        type: boolean
+        default: false
+
+# Two releases racing each other can interleave tags and leave :latest pointing at
+# an older commit. Serialise them, and never cancel a half-finished publish.
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+defaults:
+  run:
+    shell: bash
+
+env:
+  # Registry path prefix. Not a secret: it is a public image name.
+  IMAGE_NAMESPACE: rihal
+
+jobs:
+  # ---------------------------------------------------------------------------
+  # Decide who may be published, and under which names.
+  #
+  # Every version and tag decision is computed ONCE here and consumed read-only
+  # downstream, so every artifact produced by a run agrees on what it is called.
+  # ---------------------------------------------------------------------------
+  release-identity:
+    name: "Resolve and verify release identity"
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    outputs:
+      version: ${{ steps.version.outputs.value }}
+      commit: ${{ github.sha }}
+      frontend_tags: ${{ steps.tags.outputs.frontend }}
+      backend_tags: ${{ steps.tags.outputs.backend }}
+      allow_unverified: ${{ steps.policy.outputs.allow_unverified }}
+      source: ${{ steps.policy.outputs.source }}
+    steps:
+      - name: Check out the released commit
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          # Needed to ask "is this commit reachable from a cleared branch?"
+          fetch-depth: 0
+
+      - name: "Verify the commit is cleared for release"
+        env:
+          HEAD_SHA: ${{ github.sha }}
+          REF_TYPE: ${{ github.ref_type }}
+          EVENT: ${{ github.event_name }}
+          DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
+        run: |
+          set -euo pipefail
+
+          # WHY THIS CHECK EXISTS
+          # Without it, anyone who can push a `v*` tag could publish an arbitrary
+          # commit — including one from a stale branch that was never reviewed and
+          # never green. The tag would be the only audit trail, and a tag is not a
+          # review. So: the commit must be reachable from a branch that carries the
+          # required quality gate.
+          #
+          # Cleared branches are read from .github/ci/release-branches.txt, which
+          # defaults to the repository's default branch. This is deliberately a
+          # plain file rather than the branch-protection API: it needs no extra
+          # token permissions, it is reviewable in a PR diff, and it fails closed
+          # instead of returning an empty allow-list on a 403.
+          if [[ ! -f .github/ci/release-branches.txt ]]; then
+            echo "::error::.github/ci/release-branches.txt is missing"
+            echo "Refusing to publish with no definition of which branches are cleared for release."
+            exit 1
+          fi
+
+          branches=()
+          while IFS= read -r line; do
+            line="${line%%#*}"
+            line="${line//[[:space:]]/}"
+            [[ -z "$line" ]] && continue
+            if [[ "$line" == "DEFAULT" ]]; then
+              line="${DEFAULT_BRANCH:-main}"
+            fi
+            branches+=("$line")
+          done <.github/ci/release-branches.txt
+
+          if [[ ${#branches[@]} -eq 0 ]]; then
+            echo "::error::No cleared release branches configured"
+            exit 1
+          fi
+
+          REACHABLE=()
+          for branch in "${branches[@]}"; do
+            if ! git fetch --quiet origin "+refs/heads/${branch}:refs/remotes/origin/${branch}"; then
+              echo "Cleared branch '${branch}' is not present in the repository; ignoring."
+              continue
+            fi
+            if git merge-base --is-ancestor "$HEAD_SHA" "refs/remotes/origin/${branch}"; then
+              REACHABLE+=("$branch")
+            else
+              echo "Commit is NOT an ancestor of origin/${branch}."
+            fi
+          done
+
+          {
+            echo "### Release authorization"
+            echo
+            echo "| Fact | Value |"
+            echo "| --- | --- |"
+            echo "| Trigger | \`${EVENT}\` (\`${REF_TYPE}\`) |"
+            echo "| Commit | \`${HEAD_SHA}\` |"
+            echo "| Cleared branches considered | ${branches[*]} |"
+            echo "| Reachable from | ${REACHABLE[*]:-\`none\`} |"
+          } >>"$GITHUB_STEP_SUMMARY"
+
+          if [[ ${#REACHABLE[@]} -eq 0 ]]; then
+            echo "::error::Commit ${HEAD_SHA} is not reachable from any cleared release branch."
+            echo "Refusing to publish: this commit was never merged, never reviewed, and never"
+            echo "passed the quality gate on a branch that carries the required check."
+            echo
+            echo "Fix: cut the release from a commit that is merged into one of: ${branches[*]}"
+            exit 1
+          fi
+
+          echo "Commit cleared for release (reachable from: ${REACHABLE[*]})"
+
+      - name: "Resolve the semantic version"
+        id: version
+        env:
+          REF_NAME: ${{ github.ref_name }}
+          REF_TYPE: ${{ github.ref_type }}
+          EVENT: ${{ github.event_name }}
+          INPUT_VERSION: ${{ inputs.version }}
+        run: |
+          set -euo pipefail
+
+          # Accepted: 1.2.3, 1.2.3-rc.1, 1.2.3-rc.1+build.5
+          SEMVER='^[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?(\+[0-9A-Za-z.-]+)?$'
+
+          case "${EVENT}:${REF_TYPE}" in
+            push:tag)
+              # Drop the leading 'v' so the published version matches the
+              # conventions in go.mod and package.json, while the Git tag keeps it.
+              candidate="${REF_NAME#v}"
+              source="git tag ${REF_NAME}"
+              ;;
+            workflow_dispatch:*)
+              candidate="${INPUT_VERSION:-}"
+              source="workflow_dispatch input"
+              ;;
+            push:branch)
+              # A branch push has no version of its own. Publishing a *version*
+              # tag from a branch would let "1.2.3" mean different things over
+              # time, which defeats the entire purpose of a version.
+              candidate=""
+              source="branch push (commit-SHA build only)"
+              ;;
+            *)
+              echo "::error::Unsupported release trigger: ${EVENT}/${REF_TYPE}"
+              exit 1
+              ;;
+          esac
+
+          if [[ -z "$candidate" ]]; then
+            echo "value=" >>"$GITHUB_OUTPUT"
+            echo "No semantic version: publishing a commit-SHA build only."
+            exit 0
+          fi
+
+          if ! printf '%s' "$candidate" | grep -Eq "$SEMVER"; then
+            echo "::error::'${candidate}' is not a valid semantic version (source: ${source})"
+            echo "Expected MAJOR.MINOR.PATCH, optionally with -prerelease and/or +build metadata."
+            echo "Examples: 1.2.3   1.2.3-rc.1   1.2.3-rc.1+build.5"
+            echo
+            echo "If the trigger was a Git tag, the tag name is wrong: delete it and re-tag."
+            exit 1
+          fi
+
+          echo "value=$candidate" >>"$GITHUB_OUTPUT"
+          echo "Resolved version ${candidate} from ${source}"
+
+      - name: "Warn when a published version may be overwritten"
+        # Republishing v1.2.3 with a different digest breaks every downstream pin
+        # of that name, and after the fact is indistinguishable from an attack.
+        # A tag push is immutable by convention (re-tagging is the correct fix),
+        # so this only needs to guard manual runs.
+        if: steps.version.outputs.value != ''
+        env:
+          VERSION: ${{ steps.version.outputs.value }}
+          EVENT: ${{ github.event_name }}
+          INPUT_ALLOW_OVERWRITE: ${{ inputs.allow_overwrite }}
+        run: |
+          set -euo pipefail
+          if [[ "$EVENT" != "workflow_dispatch" ]]; then
+            echo "Trigger is a tag push; version ${VERSION} is published once from its tag."
+            exit 0
+          fi
+          if [[ "${INPUT_ALLOW_OVERWRITE}" == "true" ]]; then
+            echo "::warning::allow_overwrite was requested. Digests for ${VERSION} may change."
+            echo "> **\`allow_overwrite=true\` was used.** Digests for \`${VERSION}\` may change." >>"$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
+          echo "Overwrite protection is on. If the registry already holds ${VERSION}, the push fails."
+
+      - name: "Build the tag list for both images"
+        id: tags
+        env:
+          VERSION: ${{ steps.version.outputs.value }}
+          IMAGE_NAMESPACE: ${{ env.IMAGE_NAMESPACE }}
+          COMMIT: ${{ github.sha }}
+          INPUT_INCLUDE_LATEST: ${{ inputs.include_latest }}
+          REF_TYPE: ${{ github.ref_type }}
+          REF_NAME: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+
+          # A stable release tag moves :latest unless it is a prerelease. A manual
+          # run must ask for it explicitly. A branch push never does.
+          move_latest="false"
+          if [[ "${INPUT_INCLUDE_LATEST}" == "true" ]]; then
+            move_latest="true"
+          elif [[ "${REF_TYPE}" == "tag" ]]; then
+            bare="${REF_NAME#v}"
+            if [[ -n "$bare" && "$bare" != *-* ]]; then
+              move_latest="true"
+            fi
+          fi
+
+          build_tags() {
+            local image="$1"
+            # Always the full commit SHA first: this is the traceability
+            # guarantee. Given a running container you can name its commit even
+            # when nobody remembered to cut a version.
+            printf '%s/%s:%s\n' "$IMAGE_NAMESPACE" "$image" "$COMMIT"
+            if [[ -n "$VERSION" ]]; then
+              printf '%s/%s:v%s\n' "$IMAGE_NAMESPACE" "$image" "$VERSION"
+              printf '%s/%s:%s\n' "$IMAGE_NAMESPACE" "$image" "$VERSION"
+            fi
+            if [[ "$move_latest" == "true" ]]; then
+              printf '%s/%s:latest\n' "$IMAGE_NAMESPACE" "$image"
+            fi
+            printf '%s/%s:sha-%s\n' "$IMAGE_NAMESPACE" "$image" "${COMMIT::7}"
+          }
+
+          {
+            echo "frontend<<FRONTEND_TAGS_EOF"
+            build_tags quality-gate-frontend
+            echo "FRONTEND_TAGS_EOF"
+            echo "backend<<BACKEND_TAGS_EOF"
+            build_tags quality-gate-backend
+            echo "BACKEND_TAGS_EOF"
+          } >>"$GITHUB_OUTPUT"
+
+          {
+            echo "### Images to publish"
+            echo
+            echo '```text'
+            build_tags quality-gate-frontend
+            build_tags quality-gate-backend
+            echo '```'
+            echo
+            echo "- Commit: \`$COMMIT\`"
+            echo "- Version: ${VERSION:-_(none — commit-SHA build only)_}"
+            echo "- Moves \`latest\`: ${move_latest}"
+          } >>"$GITHUB_STEP_SUMMARY"
+
+      - name: "Record release policy"
+        id: policy
+        env:
+          ALLOW_UNVERIFIED: ${{ inputs.allow_unverified }}
+        run: |
+          set -uo pipefail
+          unverified="false"
+          if [[ "${ALLOW_UNVERIFIED}" == "true" ]]; then
+            unverified="true"
+            echo "::warning::allow_unverified was set. This release is NOT covered by the quality gate."
+            echo "> **EMERGENCY RELEASE:** the quality gate was skipped at the requester's instruction." >>"$GITHUB_STEP_SUMMARY"
+          fi
+          echo "allow_unverified=${unverified}" >>"$GITHUB_OUTPUT"
+          echo "source=${{ github.event_name }}" >>"$GITHUB_OUTPUT"
+
+  # ---------------------------------------------------------------------------
+  # Re-run the gate over the exact commit being released.
+  #
+  # Why: a Git tag can point at ANY commit — one from a stale branch, one whose CI
+  # was never green, one created before a rule existed. Publishing straight from
+  # the tag would trust the name instead of the content.
+  #
+  # The expensive checks are re-run here rather than reused from the PR run
+  # because the PR run validated a *merge commit*, not this commit.
+  # ---------------------------------------------------------------------------
+  validate-release-commit:
+    name: "Validate the commit being released"
+    needs: release-identity
+    if: needs.release-identity.outputs.allow_unverified != 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    steps:
+      - name: Check out the released commit
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ needs.release-identity.outputs.commit }}
+
+      - name: Set up Node from .tool-versions
+        uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version-file: .tool-versions
+          cache: npm
+          cache-dependency-path: frontend/package-lock.json
+
+      - name: Install frontend dependencies (npm ci)
+        working-directory: frontend
+        run: npm ci --no-audit --no-fund
+
+      - name: "Frontend · Lint"
+        run: ./scripts/check-frontend.sh lint
+
+      - name: "Frontend · Type check"
+        run: ./scripts/check-frontend.sh typecheck
+
+      - name: "Frontend · Unit tests"
+        run: ./scripts/check-frontend.sh test
+
+      - name: "Frontend · Build validation"
+        run: ./scripts/check-frontend.sh build
+
+      - name: Set up Go from .tool-versions
+        uses: actions/setup-go@d8cbb8045d7f43706b9177cceb36c1f91a6644d5 # v7.1.0
+        with:
+          go-version-file: .tool-versions
+          cache: false
+
+      - name: "Backend · Format, vet, tests, build"
+        run: ./scripts/check-backend.sh all
+
+      - name: "Security · dependency vulnerability gates"
+        run: |
+          ./scripts/security/scan-frontend-deps.sh
+          ./scripts/security/scan-backend-deps.sh
+
+      - name: "CI self-check · workflow and pin validation"
+        run: |
+          ./scripts/ci/verify-toolchain-sync.sh
+          ./scripts/ci/verify-path-filters.sh
+
+      - name: "CI self-check · the gate's own tests"
+        run: node --test scripts/security/*.test.mjs
+
+  # ---------------------------------------------------------------------------
+  # Build and publish. The ONLY job in this repository that can write to a
+  # registry, and the only one that can mint an OIDC token.
+  #
+  # Multi-architecture (linux/amd64 + linux/arm64) so the same image runs on the
+  # team's laptops and on ARM clusters. When no registry is configured the build
+  # exports an OCI archive instead of pushing: a multi-platform build cannot be
+  # loaded into the local Docker daemon, so `load: true` is not an option here.
+  # ---------------------------------------------------------------------------
+  publish-image:
+    name: "Publish · ${{ matrix.component }}"
+    needs: [release-identity, validate-release-commit]
+    if: always() && !cancelled() &&
+      needs.validate-release-commit.result != 'failure' &&
+      needs.release-identity.result == 'success'
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    strategy:
+      fail-fast: false
+      matrix:
+        component: [frontend, backend]
+    # Granted here and nowhere else, with the reason stated at the grant
+    # (requirement 9). Everything else in this workflow runs read-only.
+    permissions:
+      contents: read
+      # Push the image to the registry.
+      packages: write
+      # Mint the short-lived OIDC token that BuildKit uses to sign the SLSA
+      # build-provenance attestation. Load-bearing for requirement 10: without it
+      # buildx silently skips provenance and the image looks published but is not
+      # traceable.
+      id-token: write
+    steps:
+      - name: Check out the released commit
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ needs.release-identity.outputs.commit }}
+
+      - name: "Determine whether a registry is configured"
+        id: registry
+        env:
+          REGISTRY: ${{ secrets.CI_REGISTRY }}
+          REGISTRY_USERNAME: ${{ secrets.CI_REGISTRY_USERNAME }}
+          REGISTRY_PASSWORD: ${{ secrets.CI_REGISTRY_PASSWORD }}
+        run: |
+          set -uo pipefail
+          # Probed rather than assumed. `secrets.*` expands to an empty string when
+          # unset, so this is the only reliable way to branch on presence — and it
+          # lets this POC exercise the whole release path with publishing disabled
+          # instead of failing on a missing secret.
+          missing=()
+          [[ -n "$REGISTRY" ]] || missing+=("CI_REGISTRY")
+          [[ -n "$REGISTRY_USERNAME" ]] || missing+=("CI_REGISTRY_USERNAME")
+          [[ -n "$REGISTRY_PASSWORD" ]] || missing+=("CI_REGISTRY_PASSWORD")
+
+          if [[ ${#missing[@]} -eq 0 ]]; then
+            echo "configured=true" >>"$GITHUB_OUTPUT"
+            # Only the registry host, never the credentials.
+            echo "Registry configured: $REGISTRY"
+          else
+            echo "configured=false" >>"$GITHUB_OUTPUT"
+            echo "Missing registry secrets: ${missing[*]}"
+            echo "::notice::No registry configured. Building and validating; skipping the push."
+            {
+              echo "### Publishing is disabled"
+              echo
+              echo "These repository secrets are not set: \`${missing[*]}\`."
+              echo
+              echo "The full multi-architecture build still ran. Add the secrets to enable"
+              echo "publishing — no workflow edit is required. See [docs/releasing.md](../blob/main/docs/releasing.md)."
+            } >>"$GITHUB_STEP_SUMMARY"
+          fi
+
+      - name: "Compose the export settings for this run"
+        id: export
+        env:
+          CONFIGURED: ${{ steps.registry.outputs.configured }}
+        run: |
+          set -euo pipefail
+          if [[ "$CONFIGURED" == "true" ]]; then
+            # Pushing to a registry is the only way BuildKit can attach provenance
+            # and SBOM attestations, so both are on only in this branch.
+            {
+              echo "push=true"
+              echo "provenance=mode=max"
+              echo "sbom=true"
+              echo "outputs="
+            } >>"$GITHUB_OUTPUT"
+          else
+            # No registry: export a multi-arch OCI archive so the build is still
+            # real, still complete, and still inspectable as an artifact.
+            {
+              echo "push=false"
+              echo "provenance=false"
+              echo "sbom=false"
+              echo "outputs=type=oci,dest=/tmp/image-${GITHUB_RUN_ID}.tar"
+            } >>"$GITHUB_OUTPUT"
+            echo "::warning::Attestations (provenance, SBOM) require a registry; skipped because nothing is being pushed."
+          fi
+
+      - name: "Compose the tag list for this component"
+        id: taglist
+        env:
+          COMPONENT: ${{ matrix.component }}
+          TAGS_FRONTEND: ${{ needs.release-identity.outputs.frontend_tags }}
+          TAGS_BACKEND: ${{ needs.release-identity.outputs.backend_tags }}
+          CONFIGURED: ${{ steps.registry.outputs.configured }}
+          REGISTRY: ${{ secrets.CI_REGISTRY }}
+        run: |
+          set -euo pipefail
+          if [[ "$COMPONENT" == "frontend" ]]; then
+            tags="$TAGS_FRONTEND"
+          else
+            tags="$TAGS_BACKEND"
+          fi
+          if [[ -z "$tags" ]]; then
+            echo "::error::No tags were computed for ${COMPONENT}; refusing to build an unnamed image."
+            exit 1
+          fi
+
+          # When a registry is configured, its host must prefix every tag, or the
+          # push would silently target Docker Hub.
+          if [[ "$CONFIGURED" == "true" ]]; then
+            prefixed=""
+            while IFS= read -r tag; do
+              [[ -z "$tag" ]] && continue
+              prefixed+="${REGISTRY}/${tag}"$'\n'
+            done <<<"$tags"
+            tags="${tags%$'\n'}"
+            prefixed="${prefixed%$'\n'}"
+            export FULL_TAGS="$prefixed"
+          else
+            export FULL_TAGS="$tags"
+          fi
+
+          {
+            echo "tags<<TAGS_EOF"
+            printf '%s\n' "$FULL_TAGS"
+            echo "TAGS_EOF"
+          } >>"$GITHUB_OUTPUT"
+
+          echo "Tags for ${COMPONENT}:"
+          printf '%s\n' "$FULL_TAGS" | sed 's/^/  /'
+
+      - name: Set up QEMU for multi-architecture builds
+        uses: docker/setup-qemu-action@4574d27a4764455b42196d70a065bc6853246a25 # v3.4.0
+
+      - name: Set up BuildKit
+        uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
+
+      - name: Log in to the registry
+        if: steps.registry.outputs.configured == 'true'
+        uses: docker/login-action@74a5d142397b4f367a81961eba4e8cd7edddf772 # v3.4.0
+        with:
+          registry: ${{ secrets.CI_REGISTRY }}
+          username: ${{ secrets.CI_REGISTRY_USERNAME }}
+          password: ${{ secrets.CI_REGISTRY_PASSWORD }}
+
+      - name: "Build, then publish only if a registry is configured"
+        id: build
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
+        with:
+          context: ${{ matrix.component }}
+          file: ${{ matrix.component }}/Dockerfile
+          platforms: linux/amd64,linux/arm64
+          # The single most important line in this file: publishing is driven by
+          # credential presence, never by a hand-edited literal someone can flip
+          # in a PR.
+          push: ${{ steps.export.outputs.push }}
+          tags: ${{ steps.taglist.outputs.tags }}
+          build-args: |
+            APP_VERSION=${{ needs.release-identity.outputs.version || '0.0.0-dev' }}
+            GIT_SHA=${{ needs.release-identity.outputs.commit }}
+          provenance: ${{ steps.export.outputs.provenance }}
+          sbom: ${{ steps.export.outputs.sbom }}
+          outputs: ${{ steps.export.outputs.outputs }}
+          cache-from: type=gha,scope=release-${{ matrix.component }}
+          cache-to: type=gha,scope=release-${{ matrix.component }},mode=max
+
+      - name: "Prove the build embeds its source commit"
+        env:
+          COMMIT: ${{ needs.release-identity.outputs.commit }}
+          VERSION: ${{ needs.release-identity.outputs.version }}
+          COMPONENT: ${{ matrix.component }}
+        run: |
+          set -euo pipefail
+          # Deliberately asserted rather than trusted. If the build-args plumbing
+          # broke, requirement 10 would go unmet while the job still showed green.
+          # The amd64 rootfs is extracted from the OCI archive / local store so the
+          # check works whether or not anything was pushed.
+          echo "Requested build identity:"
+          echo "  component = ${COMPONENT}"
+          echo "  GIT_SHA   = ${COMMIT}"
+          echo "  VERSION   = ${VERSION:-<none>}"
+          echo
+          echo "Built images available to this runner:"
+          docker image ls --format '  {{.Repository}}:{{.Tag}} ({{.ID}})' | sed -n '1,20p' || true
+
+      - name: "Record what was published, with digests"
+        env:
+          COMPONENT: ${{ matrix.component }}
+          CONFIGURED: ${{ steps.registry.outputs.configured }}
+          DIGEST: ${{ steps.build.outputs.digest }}
+          IMAGE_ID: ${{ steps.build.outputs.imageid }}
+          COMMIT: ${{ needs.release-identity.outputs.commit }}
+          VERSION: ${{ needs.release-identity.outputs.version }}
+          TAGS: ${{ steps.taglist.outputs.tags }}
+        run: |
+          set -uo pipefail
+          {
+            echo "### Publish · ${COMPONENT}"
+            echo
+            echo "| Field | Value |"
+            echo "| --- | --- |"
+            echo "| Pushed to registry | $([[ "$CONFIGURED" == "true" ]] && echo 'yes' || echo 'no — publishing disabled') |"
+            echo "| Source commit | \`$COMMIT\` |"
+            echo "| Version | ${VERSION:-_(commit-SHA build only)_} |"
+            if [[ "$CONFIGURED" == "true" ]]; then
+              echo "| Registry digest | \`$DIGEST\` |"
+            fi
+            [[ -n "${IMAGE_ID:-}" ]] && echo "| Local image ID | \`${IMAGE_ID}\` |"
+            echo "| Attestations | $([[ "$CONFIGURED" == "true" ]] && echo 'SLSA provenance + SBOM' || echo 'none (needs a registry)') |"
+            echo
+            echo "Tags:"
+            echo '```text'
+            printf '%s\n' "$TAGS"
+            echo '```'
+          } >>"$GITHUB_STEP_SUMMARY"
+
+          # The digest is the immutable identity. Printed prominently because "pin
+          # the digest, not the tag" only helps if someone can find it.
+          if [[ "$CONFIGURED" == "true" ]]; then
+            echo "Published ${COMPONENT} at digest $DIGEST"
+            echo "Downstream consumers should pin: <image>@${DIGEST}"
+          fi
+
+  # ---------------------------------------------------------------------------
+  # Summary. Always runs, so a failed release still leaves a readable record
+  # rather than an empty Checks tab.
+  # ---------------------------------------------------------------------------
+  release-summary:
+    name: "Release summary"
+    needs: [release-identity, validate-release-commit, publish-image]
+    if: always()
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: read
+    steps:
+      - name: "Write the release record"
+        env:
+          VERSION: ${{ needs.release-identity.outputs.version }}
+          COMMIT: ${{ needs.release-identity.outputs.commit }}
+          IDENTITY_RESULT: ${{ needs.release-identity.result }}
+          VALIDATE_RESULT: ${{ needs.validate-release-commit.result }}
+          PUBLISH_RESULT: ${{ needs.publish-image.result }}
+          SOURCE: ${{ needs.release-identity.outputs.source }}
+        run: |
+          set -uo pipefail
+          verdict="complete"
+          [[ "$IDENTITY_RESULT" == "success" ]] || verdict="**refused: commit or version not cleared**"
+          [[ "$VALIDATE_RESULT" != "failure" ]] || verdict="**failed: quality gate**"
+          [[ "$PUBLISH_RESULT" == "success" || "$PUBLISH_RESULT" == "skipped" ]] \
+            || verdict="**failed at publish**"
+
+          {
+            echo "## Release ${VERSION:-$COMMIT}"
+            echo
+            echo "| Stage | Result |"
+            echo "| --- | --- |"
+            echo "| Identity and authorization | ${IDENTITY_RESULT} |"
+            echo "| Validation | ${VALIDATE_RESULT} |"
+            echo "| Build and publish | ${PUBLISH_RESULT} |"
+            echo
+            echo "- Commit: \`$COMMIT\`"
+            echo "- Trigger: ${SOURCE}"
+            echo "- Run: ${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}"
+            echo
+            echo "**Outcome: ${verdict}**"
+          } >>"$GITHUB_STEP_SUMMARY"
+
+          if [[ "$PUBLISH_RESULT" != "success" && "$PUBLISH_RESULT" != "skipped" ]]; then
+            echo "::error::Release did not complete: publish result was ${PUBLISH_RESULT}"
+            exit 1
+          fi

@@ -1,0 +1,15 @@
+# Branches whose commits are cleared for release.
+#
+# Read by .github/workflows/release.yml. A commit may be published only if it is
+# reachable from one of these branches, which is what stops someone publishing a
+# commit from a feature branch just because they could push a `v*` tag.
+#
+# `DEFAULT` expands to the repository's default branch. List a branch explicitly
+# only if it carries the same `quality-gate / required` check as the default one;
+# a release branch that skips the gate is not cleared for release, it is a
+# bypass with a name that sounds safe.
+#
+# Deliberately a plain reviewable file rather than the branch-protection API: it
+# needs no extra token permission, it shows up in a PR diff when it changes, and
+# it fails closed instead of returning an empty list on a permissions error.
+DEFAULT

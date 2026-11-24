@@ -1,0 +1,33 @@
+{
+  "name": "@rihal/quality-gate-frontend",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Minimal frontend used to prove the PR quality gate (lint, type check, unit test, build).",
+  "engines": {
+    "node": ">=20.19"
+  },
+  "scripts": {
+    "dev": "vite",
+    "build": "vite build",
+    "preview": "vite preview",
+    "lint": "eslint .",
+    "lint:fix": "eslint . --fix",
+    "typecheck": "tsc --noEmit",
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "test:coverage": "vitest run --coverage"
+  },
+  "devDependencies": {
+    "@eslint/js": "9.39.1",
+    "@types/node": "22.19.2",
+    "@vitest/coverage-v8": "3.2.4",
+    "esbuild": "0.27.2",
+    "eslint": "9.39.1",
+    "globals": "16.5.0",
+    "typescript": "5.9.3",
+    "typescript-eslint": "8.46.4",
+    "vite": "7.2.4",
+    "vitest": "3.2.4"
+  }
+}

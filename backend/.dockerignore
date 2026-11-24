@@ -1,0 +1,11 @@
+# Keep the build context small and reproducible.
+# Everything not needed to compile must be excluded: it speeds up the build and
+# means build secrets or local artefacts cannot leak into an image by accident.
+bin/
+*.test
+coverage.out
+*.md
+.git
+.gitignore
+Dockerfile
+.dockerignore

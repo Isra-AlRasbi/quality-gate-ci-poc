@@ -1,0 +1,63 @@
+# Runs the sample stack locally with the same images CI builds.
+#
+# Not a deployment template and not a production topology: it exists so that
+# "does the container actually work?" is one command on a laptop, which is the
+# fastest way to notice a Dockerfile regression. CI verifies the frontend image
+# standalone (its container must start with no backend present), so this file is
+# for convenience, not for validation.
+#
+#   docker compose up --build
+#   open http://localhost:4080
+#   curl localhost:4081/api/checks
+#
+# Ports are variables because fixed ones eventually collide with something else
+# already running on a dev machine:
+#
+#   WEB_PORT=9000 API_PORT=9001 docker compose up --build
+services:
+  backend:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+      args:
+        # Overridable so a local build can look like a CI build:
+        #   GIT_SHA=$(git rev-parse HEAD) docker compose up --build
+        APP_VERSION: ${APP_VERSION:-0.0.0-local}
+        GIT_SHA: ${GIT_SHA:-unknown}
+    image: quality-gate-poc-backend:local
+    container_name: qg-backend
+    restart: "no"
+    ports:
+      # Published only so `curl localhost:${API_PORT}/api/checks` works directly.
+      # The SPA reaches the backend through the frontend's /api/ proxy, not here.
+      - '${API_PORT:-4081}:8080'
+    networks:
+      - qg
+    # No healthcheck: the backend image is `scratch`, so there is no shell to run
+    # one from. GET /healthz is the liveness endpoint for an orchestrator.
+
+  frontend:
+    build:
+      context: ./frontend
+      dockerfile: Dockerfile
+      args:
+        APP_VERSION: ${APP_VERSION:-0.0.0-local}
+        GIT_SHA: ${GIT_SHA:-unknown}
+    image: quality-gate-poc-frontend:local
+    container_name: qg-frontend
+    restart: "no"
+    ports:
+      - '${WEB_PORT:-4080}:8080'
+    depends_on:
+      - backend
+    networks:
+      - qg
+    environment:
+      # The nginx template resolves this per request, so the frontend container
+      # starts even when the backend is missing. `backend` is this project's service
+      # name, resolved by Docker's DNS on the network below.
+      API_UPSTREAM: backend
+
+networks:
+  qg:
+    driver: bridge

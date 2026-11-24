@@ -1,0 +1,12 @@
+# Single source of truth for toolchain versions (requirement: reliability).
+#
+# CI, Docker images, local dev and pre-commit checks all read the pinned values
+# from this file (or mirror them in .github/ci/toolchain.lock.env, which
+# ci-self-check verifies). One version bump = one commit.
+#
+# We deliberately use the *release line* rather than "latest". An unpinned
+# toolchain makes CI nondeterministic: the same commit can pass on Monday and
+# fail on Wednesday because a toolchain was released overnight, which destroys
+# the "same code, same result" property this POC is meant to measure.
+nodejs 22.21.1
+golang 1.26.11

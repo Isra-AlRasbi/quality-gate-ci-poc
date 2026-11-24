@@ -1,0 +1,30 @@
+<!doctype html>
+<html lang="en" dir="ltr">
+  <!--
+    dir="ltr" is intentional. Arabic/RTL validation is listed as a future
+    architecture-dependent check (see docs/extending-the-gate.md); when it is
+    adopted, this page becomes the thing under test.
+  -->
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Rihal CI Quality Gate POC</title>
+  </head>
+  <body>
+    <main class="page">
+      <h1>PR Quality Gate</h1>
+      <p class="lede">
+        A deliberately tiny frontend whose only job is to give the CI pipeline
+        something real to build, lint, type check and test.
+      </p>
+      <section id="status-summary" aria-live="polite">
+        <h2>Gate status</h2>
+        <p id="overall">Loading&hellip;</p>
+        <p id="totals"></p>
+        <ul id="check-list"></ul>
+      </section>
+      <p class="footnote"><span id="build-info"></span></p>
+    </main>
+    <script type="module" src="/src/main.ts"></script>
+  </body>
+</html>

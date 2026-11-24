@@ -1,0 +1,106 @@
+# gitleaks configuration for this repository.
+#
+# WHY A CONFIG FILE AT ALL
+# The default ruleset is a good starting point, but this repository deliberately
+# contains hundreds of long hex strings (action SHAs and image digests pinned for
+# supply-chain integrity). Without an explicit allowlist, a generic high-entropy
+# rule flags them, and the first thing a developer does with a noisy secret scanner
+# is disable it. So the allowlist below is not convenience, it is what keeps the
+# check running at all.
+#
+# AN ALLOWLIST ENTRY IS A SECURITY DECISION
+# Every entry must say what it permits and why. An entry scoped to a specific
+# *line shape* is acceptable; a blanket "ignore everything under scripts/" is not,
+# because it silently disables the check for whole directories.
+
+title = "gitleaks config for quality-gate-ci-poc"
+
+# Extend rather than replace: dropping the default rules to add an allowlist would
+# turn the scan off while looking like it was configured.
+[extend]
+useDefault = true
+
+[[rules]]
+id = "poc-test-fake-secret"
+description = "Fake credentials used by the gate's own tests"
+regex = '''(?i)fake[-_]secret[-_][A-Za-z0-9]{8,}'''
+secretGroup = 0
+keywords = ["fake_secret", "fake-secret", "FAKE_SECRET"]
+
+# ---------------------------------------------------------------------------
+# Project rules closing three measured gaps in gitleaks v8.30.1's 222 default
+# rules. Each was tested against the shipped regexes in config/gitleaks.toml at
+# that tag, not against documentation. The default ruleset is strong on vendor
+# token *shapes* and silent on generic credential *constructs*, which is the
+# opposite of what most repositories actually leak.
+# ---------------------------------------------------------------------------
+
+[[rules]]
+id = "http-basic-auth-header"
+description = "HTTP Basic credentials hardcoded in an Authorization header"
+# The header name is required. A rule matching any `Basic <base64>` also matches
+# certificates, sourcemaps, inline assets and base64 test fixtures, and a rule
+# that fires on all of those gets deleted in its second week -- which is a worse
+# security outcome than missing the unlabelled YAML form this rule does not see.
+regex = '''(?i)\bauthorization\b[\s'"]{0,3}[:=][\s'"]{0,3}basic[\s'"]+([A-Za-z0-9+/]{16,}={0,2})'''
+secretGroup = 1
+keywords = ["basic"]
+
+[[rules]]
+# The description deliberately avoids spelling the shape it matches. Config file
+# contents are scanned like any other file, and writing `user:password@host` here
+# would be an 8-character value in exactly the position the rule looks for. gitleaks
+# allowlists `gitleaks.toml` by default, so this is belt-and-braces rather than a fix,
+# but relying on that means a future `[extend]` change turns the config into a finding.
+id = "credentials-in-connection-uri"
+description = "Password embedded in a connection URI"
+# Catches postgres/mysql/rediss/amqp/mongodb URIs with an inline password. The
+# default ruleset has no URI rule at all, and a database password in a compose
+# file or an env file is the most likely real finding in a service repository.
+regex = '''[a-zA-Z][a-zA-Z0-9+.-]*://[^/\s:@"']{1,64}:([^/\s:@"']{8,})@[^\s@"']{1,253}'''
+secretGroup = 1
+keywords = ["://"]
+
+# Placeholder values in documentation and examples, so this rule does not train
+# people to reach for --no-verify. This is not an exemption-by-location: every
+# real password on the same line as a placeholder is still reported, which is
+# asserted by scripts/security/selftest-secrets.sh.
+[[rules.allowlists]]
+description = "Documentation placeholders and unresolved template references"
+stopwords = [
+    "changeme",
+    "CHANGEME",
+    "change_me",
+    "change-me",
+    "replace_me",
+    "replace-me",
+    "yourpassword",
+    "your_password",
+    "your-password",
+    "mypassword",
+    "Password1",
+    "example",
+    "placeholder",
+    "dummy",
+    "testpass",
+    "hunter2",
+    "xxx",
+    "TODO",
+]
+
+[allowlist]
+description = "Non-secret high-entropy strings this repository pins on purpose"
+regexes = '''
+ghcr\.io/[^\s]+@sha256:[0-9a-f]{64}
+docker\.io/[^\s]+@sha256:[0-9a-f]{64}
+[^\s]+@sha256:[0-9a-f]{64}
+@[0-9a-f]{40}\s+#\s+v
+sha256:[0-9a-f]{64}
+'''
+# Nothing here is an exemption-by-location. Paths are listed only for files that
+# contain no code or configuration a secret could legitimately live in.
+paths = '''
+\.git/
+frontend/dist/
+node_modules/
+'''
