@@ -728,6 +728,32 @@ docker-compose.yml          run the images CI builds, locally
                             line shapes (never a directory)
 ```
 
+### How the workflow and CI folders fit together
+
+**`.github/workflows/` contains the GitHub Actions entry points.** On a PR to
+`main`, `pr-quality-gate.yml` detects changed paths, runs the relevant component
+and Docker jobs plus the security and pipeline checks, and reports one `required`
+verdict. The PR workflow never pushes images. A GitHub ruleset must require that
+verdict to actually block a merge. `release.yml` is separate: a push to `main`,
+a version tag, or a manual run can validate and build multi-architecture images.
+Publishing requires both an eligible commit and registry credentials. Images are
+tagged by commit SHA, with a version tag when applicable; there is no automatic
+deployment. `scheduled-checks.yml` runs nightly or manually to recheck dependencies
+and scan Git history without delaying PRs.
+
+**`.github/ci/` contains configuration, not workflows.**
+
+| File | How it is used |
+| --- | --- |
+| `paths-filter.yaml` | The PR workflow maps changed files to frontend, backend, shared, Docker, and docs filters. For example, changing `frontend/src/main.ts` selects frontend validation and its Docker job, but not backend-only jobs. |
+| `release-branches.txt` | The release workflow verifies that the commit is reachable from a listed branch. `DEFAULT` resolves to the repository’s default branch. |
+| `toolchain.lock.env` | Records Node and Go versions plus Docker base image pins. The pipeline self-check compares these against `.tool-versions` and the Dockerfiles. |
+| `tools.lock.env` | Pins analyzer versions for govulncheck, Gitleaks, and actionlint. |
+
+Two similarly named paths serve different purposes: **`.ci/security-policies.env`**
+contains scanner thresholds; **`scripts/ci/`** contains pipeline checks such as
+pin synchronization, filter coverage, and workflow lint.
+
 ### The three conventions every script follows
 
 1. **Check logic lives in a script, never inline in YAML.** A developer who cannot run the

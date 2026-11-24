@@ -8,22 +8,80 @@
   <head>
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
-    <title>Rihal CI Quality Gate POC</title>
+    <meta name="theme-color" content="#111d2d" />
+    <title>Quality Gate · Rihal Engineering</title>
   </head>
   <body>
-    <main class="page">
-      <h1>PR Quality Gate</h1>
-      <p class="lede">
-        A deliberately tiny frontend whose only job is to give the CI pipeline
-        something real to build, lint, type check and test.
-      </p>
-      <section id="status-summary" aria-live="polite">
-        <h2>Gate status</h2>
-        <p id="overall">Loading&hellip;</p>
-        <p id="totals"></p>
-        <ul id="check-list"></ul>
+    <a class="skip-link" href="#overview">Skip to content</a>
+    <header class="topbar">
+      <div class="shell topbar-inner">
+        <a class="brand" href="#overview"><span class="brand-mark" aria-hidden="true">◆</span> Rihal <span>Engineering</span></a>
+        <nav aria-label="Page navigation">
+          <a href="#overview">Overview</a>
+          <a href="#pipeline">Pipeline guide</a>
+        </nav>
+      </div>
+    </header>
+    <main class="shell page" id="overview">
+      <section class="hero" aria-labelledby="page-title">
+        <div>
+          <p class="eyebrow">Engineering systems <span aria-hidden="true">/</span> Proof of concept</p>
+          <h1 id="page-title">PR Quality Gate</h1>
+          <p class="lede">See what gets checked before code merges, and follow the path from pull request to container release.</p>
+          <a class="hero-link" href="#pipeline">Explore the pipeline <span aria-hidden="true">↘</span></a>
+        </div>
+        <div class="hero-decoration" aria-hidden="true"><span>01</span><span>02</span><span>03</span></div>
       </section>
-      <p class="footnote"><span id="build-info"></span></p>
+
+      <section id="status-summary" aria-labelledby="status-title">
+        <div class="section-heading">
+          <div>
+            <p class="eyebrow">01 / Dashboard</p>
+            <h2 id="status-title">Sample check run</h2>
+          </div>
+          <a class="text-link" href="https://github.com/Isra-AlRasbi/quality-gate-ci-poc/actions">View real runs on GitHub <span aria-hidden="true">↗</span></a>
+        </div>
+        <div class="snapshot" role="status">
+          <div><span class="metric-label">Gate verdict</span><p id="overall" class="verdict">Loading…</p></div>
+          <div><span class="metric-label">Checks passed</span><p id="passed" class="metric">—</p></div>
+          <div><span class="metric-label">Total check time</span><p id="totals" class="metric">—</p></div>
+        </div>
+        <p class="sample-note" id="report-source">This dashboard shows demo data, not live GitHub Actions results.</p>
+        <ul class="check-grid" id="check-list"></ul>
+      </section>
+
+      <section class="guide" id="pipeline" aria-labelledby="pipeline-title">
+        <div class="section-heading">
+          <div>
+            <p class="eyebrow">02 / Repository guide</p>
+            <h2 id="pipeline-title">How CI/CD works</h2>
+          </div>
+        </div>
+        <p class="guide-intro">Workflows say <strong>when and what to run</strong>. CI configuration tells them <strong>which paths, versions, and release branches to use</strong>.</p>
+        <div class="guide-grid">
+          <article class="guide-card">
+            <p class="folder">.github/workflows/</p>
+            <h3>What runs, and when</h3>
+            <dl class="flow-list">
+              <div><dt><span class="step-label">01 · Pull request</span><code>pr-quality-gate.yml</code></dt><dd>Detects what changed, then runs the relevant lint, type checks, tests, builds, and security checks. Docker images are built and smoke-tested, not pushed. The final <code>required</code> job blocks merges only when GitHub’s ruleset requires it.</dd></div>
+              <div><dt><span class="step-label">02 · Release</span><code>release.yml</code></dt><dd>Runs on pushes to <code>main</code>, version tags, or manual dispatch. It validates the commit and builds multi-architecture images. Only eligible commits with registry credentials can publish. Images are traceable by commit SHA; nothing is deployed automatically.</dd></div>
+              <div><dt><span class="step-label">03 · Nightly or manual</span><code>scheduled-checks.yml</code></dt><dd>Rechecks dependencies against current advisories, scans Git history for secrets, and reports outdated dependencies without delaying PRs.</dd></div>
+            </dl>
+          </article>
+          <article class="guide-card">
+            <p class="folder">.github/ci/</p>
+            <h3>Configuration the workflows use</h3>
+            <dl class="flow-list">
+              <div><dt><code>paths-filter.yaml</code></dt><dd>Maps changed files to frontend, backend, shared, Docker, and docs filters so unrelated jobs can skip.</dd></div>
+              <div><dt><code>release-branches.txt</code></dt><dd>Lists branches a commit must be reachable from to be eligible for release. <code>DEFAULT</code> means the repository’s default branch.</dd></div>
+              <div><dt><code>toolchain.lock.env</code></dt><dd>Records Node and Go versions and Docker base image pins. CI checks that they agree with <code>.tool-versions</code> and the Dockerfiles.</dd></div>
+              <div><dt><code>tools.lock.env</code></dt><dd>Pins the analyzers used by CI: govulncheck, Gitleaks, and actionlint.</dd></div>
+            </dl>
+          </article>
+        </div>
+        <p class="policy-note"><strong>Also worth knowing:</strong> <code>.ci/security-policies.env</code> holds the scanner thresholds, while <code>scripts/ci/</code> contains pipeline self-checks. Neither folder contains GitHub Actions workflows.</p>
+      </section>
+      <footer class="footer"><span>Rihal Engineering · CI proof of concept</span><span id="build-info"></span></footer>
     </main>
     <script type="module" src="/src/main.ts"></script>
   </body>
