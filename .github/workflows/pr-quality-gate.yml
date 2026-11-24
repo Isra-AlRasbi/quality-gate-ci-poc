@@ -51,7 +51,7 @@ on:
 # Declared at workflow level so it cannot be missed, and deliberately read-only.
 # This workflow must not be able to write to the repository, publish a release,
 # comment on the PR, or mint an OIDC cloud identity. Read-only contents access is
-# all it needs. If a future step genuinely needs more, grant it on that single
+# the default. If a step needs more, grant it on that single
 # job and say why in a comment — never widen this block.
 # -----------------------------------------------------------------------------
 permissions:
@@ -77,6 +77,9 @@ jobs:
   # ---------------------------------------------------------------------------
   detect-changes:
     name: "Detect changed components"
+    permissions:
+      contents: read
+      pull-requests: read # paths-filter lists changed files through the PR API
     runs-on: ubuntu-latest
     timeout-minutes: 5
     outputs:

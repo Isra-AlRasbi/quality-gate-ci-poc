@@ -157,7 +157,7 @@ filter, and a helper that broke on values containing `/`.
 
 | File | Trigger | Publishes | Purpose |
 | --- | --- | --- | --- |
-| [`.github/workflows/pr-quality-gate.yml`](.github/workflows/pr-quality-gate.yml) | `pull_request`, push to `main` | **never** | The merge gate. Produces `quality-gate / required`. |
+| [`.github/workflows/pr-quality-gate.yml`](.github/workflows/pr-quality-gate.yml) | `pull_request` targeting `main` | **never** | The merge gate. Produces the `required` job check. |
 | [`.github/workflows/release.yml`](.github/workflows/release.yml) | semver tag, push to `main`, `workflow_dispatch` | only if registry secrets exist | Validate → build multi-arch → publish with provenance, SBOM and SHA tags. |
 | [`.github/workflows/scheduled-checks.yml`](.github/workflows/scheduled-checks.yml) | nightly `17 3 * * *`, `workflow_dispatch` | never | Slow-but-necessary checks: full-history secret scan, current-state dependency scans against fresh advisory data, toolchain currency. |
 
